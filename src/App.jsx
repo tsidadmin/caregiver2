@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Home, Users, UserPlus, Inbox, Heart, ClipboardList, CalendarDays,
   MessageSquare, CheckCircle2, XCircle, AlertTriangle, Search, Plus,
@@ -6,6 +6,8 @@ import {
   X, Check, Sparkles, ArrowRight, Building2, RotateCcw, ChevronRight,
   Star, UserCog, CalendarPlus, Ban,
 } from "lucide-react";
+import { loadDB, saveDB } from "./lib/db";
+import { supabase } from "./lib/supabase";
 
 /* ------------------------------------------------------------------ */
 /* Reference data                                                      */
@@ -28,20 +30,10 @@ const fmtTime = (iso) => new Date(iso).toLocaleString("en-SG", { day: "numeric",
 const isFuture = (iso) => new Date(iso).getTime() > Date.now();
 
 /* ------------------------------------------------------------------ */
-/* Storage (persists to the browser's localStorage on this machine)    */
+/* Storage \u2014 see src/lib/db.js. Data lives in Supabase (Postgres) so    */
+/* every device/console shares one live dataset instead of per-browser  */
+/* localStorage. loadDB()/saveDB() keep the same shape the app expects.  */
 /* ------------------------------------------------------------------ */
-async function loadDB() {
-  try {
-    const raw = localStorage.getItem(DB_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch (e) { /* first run or storage unavailable */ }
-  return null;
-}
-async function saveDB(db) {
-  try {
-    localStorage.setItem(DB_KEY, JSON.stringify(db));
-  } catch (e) { /* quota exceeded or storage unavailable \u2014 app still runs in-memory */ }
-}
 
 /* ------------------------------------------------------------------ */
 /* Seed data                                                           */
@@ -213,7 +205,12 @@ export default function App() {
   const [view, setView] = useState("dashboard");
   const [toast, setToast] = useState(null);
 
-  useEffect(() => { (async () => { const d = await loadDB(); setDb(d || seed()); setLoaded(true); })(); }, []);
+  const didInit = useRef(false);
+  useEffect(() => {
+    if (didInit.current) return;   // run once, even under StrictMode double-mount
+    didInit.current = true;
+    (async () => { const d = await loadDB(); setDb(d || seed()); setLoaded(true); })();
+  }, []);
   useEffect(() => { if (loaded && db) saveDB(db); }, [db, loaded]);
   useEffect(() => { if (!toast) return; const t = setTimeout(() => setToast(null), 3200); return () => clearTimeout(t); }, [toast]);
 
@@ -226,8 +223,18 @@ export default function App() {
   const employerById = (id) => db?.employers.find((e) => e.id === id);
   const openMatchForBullet = (bid) => db?.matches.find((m) => m.bulletId === bid && (m.status === "proposed" || m.status === "interview_scheduled"));
 
-  /* --- WhatsApp simulation --- */
-  const sendWA = (msgs, matchId) => setDb((d) => ({ ...d, messages: [...msgs.map((m) => ({ id: uid("wa"), at: new Date().toISOString(), matchId, ...m })), ...d.messages] }));
+  /* --- WhatsApp automation --- */
+  /* Logs the message (persisted to Supabase) AND delivers it for real via
+     the send-whatsapp Edge Function. Delivery is fire-and-forget: the log is
+     the UI's source of truth and still works before Twilio is configured. */
+  const sendWA = (msgs, matchId) => {
+    const stamped = msgs.map((m) => ({ id: uid("wa"), at: new Date().toISOString(), matchId, ...m }));
+    setDb((d) => ({ ...d, messages: [...stamped, ...d.messages] }));
+    supabase.functions
+      .invoke("send-whatsapp", { body: { messages: stamped, matchId } })
+      .then(({ data }) => { if (data && data.configured === false) console.info("WhatsApp:", data.reason); })
+      .catch((e) => console.warn("WhatsApp send skipped:", e?.message || e));
+  };
 
   /* --- actions --- */
   const addEmployer = (data) => { setDb((d) => ({ ...d, employers: [{ id: uid("e"), status: "pending", flagReason: "", createdAt: new Date().toISOString(), ...data }, ...d.employers] })); notify("Application received – pending review."); };
@@ -938,13 +945,13 @@ function Bookings({ db, addSlot, employerById }) {
 }
 
 /* ================================================================== */
-/* WhatsApp log (simulation)                                           */
+/* WhatsApp log (delivered via send-whatsapp Edge Function)            */
 /* ================================================================== */
 function Messages({ db }) {
   return (
     <div>
       <PageHead eyebrow="Automation" title="WhatsApp message log"
-        sub="Every automated notification the system would send. Wire this to the WhatsApp Business API in production." />
+        sub="Every automated notification the system sends. Each is delivered for real via the send-whatsapp Edge Function (Twilio) once its secrets are configured." />
       {db.messages.length === 0 ? <Empty icon={MessageSquare} title="No messages yet" sub="Messages are generated when you propose matches, book interviews, or close cases." /> : (
         <div className="space-y-3">
           {db.messages.map((m) => (
